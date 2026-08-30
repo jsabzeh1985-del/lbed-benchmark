@@ -50,11 +50,18 @@ jobs:
           python-version: '3.10'
 
       - name: Clone official FlexBroadcast repository
+        shell: bash
         run: |
-          git clone https://github.com/RachitG54/FlexBroadcast.git FlexBroadcast
+          set -euxo pipefail
+
+          git clone \
+            https://github.com/RachitG54/FlexBroadcast.git \
+            FlexBroadcast
+
           cd FlexBroadcast
 
-          git checkout 6c8e180d05de2e784437a0a4b191947d70b6c747
+          git checkout \
+            6c8e180d05de2e784437a0a4b191947d70b6c747
 
           echo "=== FlexBroadcast revision ==="
           git rev-parse HEAD
@@ -63,7 +70,10 @@ jobs:
             "6c8e180d05de2e784437a0a4b191947d70b6c747"
 
       - name: Create Python 3.10 environment
+        shell: bash
         run: |
+          set -euxo pipefail
+
           python -m venv garg-venv
           source garg-venv/bin/activate
 
@@ -76,7 +86,10 @@ jobs:
             wheel
 
       - name: Install FlexBroadcast Python dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
+
           source garg-venv/bin/activate
 
           python -m pip install \
@@ -88,7 +101,10 @@ jobs:
           python -m pip freeze
 
       - name: Verify Petrelic BLS12-381 backend
+        shell: bash
         run: |
+          set -euxo pipefail
+
           source garg-venv/bin/activate
 
           python - <<'PY'
@@ -108,7 +124,10 @@ jobs:
 
       - name: Inspect official test harness
         working-directory: FlexBroadcast
+        shell: bash
         run: |
+          set -euxo pipefail
+
           echo "=== Repository root ==="
           ls -la
 
@@ -123,9 +142,20 @@ jobs:
         run: |
           source ../garg-venv/bin/activate
 
+          set +e
           set -o pipefail
 
-          bash testscript.sh 2>&1 | tee ../garg_flexbe_test.log
+          bash testscript.sh \
+            2>&1 | tee ../garg_flexbe_test.log
+
+          TEST_STATUS=${PIPESTATUS[0]}
+
+          echo "${TEST_STATUS}" \
+            > ../garg_flexbe_test_exit_code.txt
+
+          echo "Official testscript.sh exit code: ${TEST_STATUS}"
+
+          exit "${TEST_STATUS}"
 
       - name: Record reproduction environment
         if: always()
@@ -141,9 +171,15 @@ jobs:
             echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
             echo "python=$(python --version 2>&1)"
             echo "libsodium=$(dpkg-query -W -f='${Version}' libsodium-dev 2>/dev/null || true)"
-            echo "test_type=correctness-smoke-test"
-            echo "performance_data_generated=no"
+            echo "test_type=official-correctness-smoke-test"
+            echo "benchmark_output_may_appear_in_test_log=yes"
+            echo "performance_data_eligible_for_paper=no"
           } > garg_flexbe_environment.txt
+
+          if [ -f garg_flexbe_test_exit_code.txt ]; then
+            echo "official_test_exit_code=$(cat garg_flexbe_test_exit_code.txt)" \
+              >> garg_flexbe_environment.txt
+          fi
 
           if [ -x garg-venv/bin/python ]; then
             {
@@ -154,22 +190,43 @@ jobs:
           fi
 
       - name: Enforce Garg correctness gate
+        if: always()
         shell: bash
         run: |
+          set -euo pipefail
+
           test -s garg_flexbe_test.log
+          test -s garg_flexbe_test_exit_code.txt
 
-          if grep -Eiq \
-            'traceback|assertionerror|segmentation fault|core dumped|(^|[^a-z])failed([^a-z]|$)|(^|[^a-z])error([^a-z]|$)' \
-            garg_flexbe_test.log; then
+          TEST_STATUS="$(cat garg_flexbe_test_exit_code.txt)"
 
+          echo "Recorded official test exit code: ${TEST_STATUS}"
+
+          if [ "${TEST_STATUS}" != "0" ]; then
             echo "GARG FLEXBE CORRECTNESS GATE FAILED"
-            echo "Failure/error pattern detected in official test output."
+            echo "Official FlexBroadcast testscript.sh returned non-zero."
             exit 1
           fi
 
+          grep -q \
+            "Testing Decryption" \
+            garg_flexbe_test.log
+
+          grep -q \
+            "Testing the centralized broadcast scheme" \
+            garg_flexbe_test.log
+
+          grep -q \
+            "Testing the public key encryption scheme" \
+            garg_flexbe_test.log
+
           echo "GARG FLEXBE CORRECTNESS GATE PASSED"
-          echo "Official FlexBroadcast testscript.sh exited successfully."
+          echo "Official FlexBroadcast testscript.sh exited with code 0."
+          echo "Expected authorized and unauthorized decryption tests completed."
+          echo "Negative-decryption labels such as 'Failed: user X' are expected"
+          echo "for recipients intentionally excluded from the broadcast set."
           echo "Repository revision:"
+
           cd FlexBroadcast
           git rev-parse HEAD
 
@@ -180,6 +237,7 @@ jobs:
           name: garg-flexbe-smoke-evidence
           path: |
             garg_flexbe_test.log
+            garg_flexbe_test_exit_code.txt
             garg_flexbe_environment.txt
           if-no-files-found: warn
           retention-days: 90
