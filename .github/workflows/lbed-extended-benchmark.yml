@@ -1,0 +1,228 @@
+name: LBED extended benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extended-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev libgmp-dev git python3
+
+      - name: Fetch native herumi mcl
+        run: |
+          git clone --depth 1 --recursive https://github.com/herumi/mcl.git "$RUNNER_TEMP/mcl"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        run: |
+          make -j2 MCL_FP_BIT=384 MCL_FR_BIT=256
+          test -f lib/libmcl.a
+
+      - name: Configure LBED harness
+        run: |
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build LBED harness
+        run: cmake --build build -j2
+
+      - name: Run extended benchmark
+        run: |
+          ./build/lbed_bench \
+            --reps 100 \
+            --warmup 10 \
+            --payload 1024 \
+            -t 10,25,50,100,200,400,800,1000 \
+          | tee lbed_extended_raw.csv
+
+      - name: Enforce correctness gate and compute extended statistics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import math
+          import statistics
+
+          RAW = "lbed_extended_raw.csv"
+          SUMMARY = "lbed_extended_summary.csv"
+
+          METRICS = [
+              "offline_ms",
+              "poly_ms",
+              "group_ms",
+              "online_ms",
+              "decrypt_ms",
+          ]
+
+          EXPECTED_T = [10, 25, 50, 100, 200, 400, 800, 1000]
+          EXPECTED_REPS = 100
+
+          with open(RAW, encoding="utf-8") as f:
+              lines = f.readlines()
+
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.startswith("t,rep,")),
+              None
+          )
+
+          if start is None:
+              raise SystemExit("ERROR: CSV header not found")
+
+          rows = list(csv.DictReader(lines[start:]))
+
+          if len(rows) != len(EXPECTED_T) * EXPECTED_REPS:
+              raise SystemExit(
+                  f"ERROR: expected {len(EXPECTED_T) * EXPECTED_REPS} rows, "
+                  f"got {len(rows)}"
+              )
+
+          grouped = {t: [] for t in EXPECTED_T}
+
+          for row in rows:
+              t = int(row["t"])
+              rep = int(row["rep"])
+
+              if t not in grouped:
+                  raise SystemExit(f"ERROR: unexpected t={t}")
+
+              if rep < 0 or rep >= EXPECTED_REPS:
+                  raise SystemExit(
+                      f"ERROR: invalid repetition index {rep} for t={t}"
+                  )
+
+              if "ok" in row:
+                  ok = str(row["ok"]).strip().lower()
+                  if ok not in ("1", "true", "yes"):
+                      raise SystemExit(
+                          f"ERROR: correctness failure at t={t}, rep={rep}"
+                      )
+
+              for metric in METRICS:
+                  value = float(row[metric])
+                  if not math.isfinite(value) or value < 0:
+                      raise SystemExit(
+                          f"ERROR: invalid {metric}={value} "
+                          f"at t={t}, rep={rep}"
+                      )
+
+              grouped[t].append(row)
+
+          for t in EXPECTED_T:
+              reps = [int(r["rep"]) for r in grouped[t]]
+
+              if len(reps) != EXPECTED_REPS:
+                  raise SystemExit(
+                      f"ERROR: t={t} has {len(reps)} rows; "
+                      f"expected {EXPECTED_REPS}"
+                  )
+
+              if len(set(reps)) != EXPECTED_REPS:
+                  raise SystemExit(
+                      f"ERROR: duplicate repetition index for t={t}"
+                  )
+
+          def percentile(values, p):
+              xs = sorted(values)
+
+              if len(xs) == 1:
+                  return xs[0]
+
+              pos = (len(xs) - 1) * p
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+
+              if lo == hi:
+                  return xs[lo]
+
+              return (
+                  xs[lo] * (hi - pos)
+                  + xs[hi] * (pos - lo)
+              )
+
+          fields = [
+              "t",
+              "metric",
+              "n",
+              "mean_ms",
+              "median_ms",
+              "sd_ms",
+              "p95_ms",
+              "min_ms",
+              "max_ms",
+          ]
+
+          with open(SUMMARY, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+
+              for t in EXPECTED_T:
+                  for metric in METRICS:
+                      values = [
+                          float(r[metric])
+                          for r in grouped[t]
+                      ]
+
+                      writer.writerow({
+                          "t": t,
+                          "metric": metric,
+                          "n": len(values),
+                          "mean_ms": f"{statistics.mean(values):.6f}",
+                          "median_ms": f"{statistics.median(values):.6f}",
+                          "sd_ms": f"{statistics.stdev(values):.6f}",
+                          "p95_ms": f"{percentile(values, 0.95):.6f}",
+                          "min_ms": f"{min(values):.6f}",
+                          "max_ms": f"{max(values):.6f}",
+                      })
+
+          print("EXTENDED BENCHMARK CORRECTNESS GATE PASSED")
+          print(f"Validated rows: {len(rows)}")
+          print(f"Repetitions per t: {EXPECTED_REPS}")
+          print(f"Recipient-set sizes: {EXPECTED_T}")
+          print("No benchmark rows were removed.")
+          PY
+
+      - name: Record environment and protocol
+        run: |
+          {
+            echo "workflow=LBED extended benchmark"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
+            echo "cpu_count=$(nproc)"
+            echo "compiler=$(c++ --version | head -1)"
+            echo "cmake=$(cmake --version | head -1)"
+            echo "openssl=$(openssl version)"
+            echo "curve=BLS12-381"
+            echo "library=herumi-mcl"
+            echo "mcl_fp_bit=384"
+            echo "mcl_fr_bit=256"
+            echo "build_type=Release"
+            echo "payload_bytes=1024"
+            echo "warmup_repetitions=10"
+            echo "measured_repetitions=100"
+            echo "t_values=10,25,50,100,200,400,800,1000"
+            echo "expected_measurements=800"
+          } > lbed_extended_environment.txt
+
+      - name: Upload extended benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-extended-benchmark-results
+          path: |
+            lbed_extended_raw.csv
+            lbed_extended_summary.csv
+            lbed_extended_environment.txt
+          if-no-files-found: error
+          retention-days: 90
