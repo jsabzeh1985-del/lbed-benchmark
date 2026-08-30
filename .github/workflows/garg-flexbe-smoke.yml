@@ -1,0 +1,166 @@
+name: Garg FlexBE Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  garg-flexbe-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout LBED benchmark repository
+        uses: actions/checkout@v4
+
+      - name: Record runner information
+        run: |
+          echo "=== GitHub Actions runner ==="
+          uname -a
+          lscpu | grep -E 'Model name|CPU\(s\)' || true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            libsodium-dev \
+            libgmp-dev \
+            libssl-dev \
+            python3.10 \
+            python3.10-dev \
+            python3.10-venv
+
+      - name: Clone official FlexBroadcast repository
+        run: |
+          git clone https://github.com/RachitG54/FlexBroadcast.git FlexBroadcast
+          cd FlexBroadcast
+
+          # Freeze the exact audited revision.
+          git checkout 6c8e180d05de2e784437a0a4b191947d70b6c747
+
+          echo "=== FlexBroadcast revision ==="
+          git rev-parse HEAD
+
+          test "$(git rev-parse HEAD)" = \
+            "6c8e180d05de2e784437a0a4b191947d70b6c747"
+
+      - name: Create Python 3.10 environment
+        run: |
+          python3.10 -m venv garg-venv
+          source garg-venv/bin/activate
+
+          python --version
+          python -m pip install --upgrade \
+            "pip<24.1" \
+            setuptools \
+            wheel
+
+      - name: Install FlexBroadcast Python dependencies
+        run: |
+          source garg-venv/bin/activate
+
+          python -m pip install \
+            "numpy<2" \
+            scipy \
+            petrelic==0.1.5
+
+          echo "=== Installed Python packages ==="
+          python -m pip freeze
+
+      - name: Verify Petrelic BLS12-381 backend
+        run: |
+          source garg-venv/bin/activate
+
+          python - <<'PY'
+          from petrelic.multiplicative.pairing import G1, G2, GT
+
+          g1 = G1.generator()
+          g2 = G2.generator()
+
+          assert g1 is not None
+          assert g2 is not None
+
+          print("PETRELIC IMPORT PASSED")
+          print("G1 generator available")
+          print("G2 generator available")
+          print("PETRELIC BACKEND SMOKE TEST PASSED")
+          PY
+
+      - name: Inspect official test harness
+        working-directory: FlexBroadcast
+        run: |
+          echo "=== Repository root ==="
+          ls -la
+
+          echo "=== testscript.sh ==="
+          cat testscript.sh
+
+          test -f testscript.sh
+
+      - name: Run official FlexBroadcast correctness tests
+        working-directory: FlexBroadcast
+        shell: bash
+        run: |
+          source ../garg-venv/bin/activate
+
+          set -o pipefail
+
+          bash testscript.sh 2>&1 | tee ../garg_flexbe_test.log
+
+      - name: Record reproduction environment
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "comparison=Garg-Lu-Waters-Wu-Flexible-Broadcast-Encryption"
+            echo "repository=RachitG54/FlexBroadcast"
+            echo "commit=6c8e180d05de2e784437a0a4b191947d70b6c747"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
+            echo "python=$(python3.10 --version 2>&1)"
+            echo "libsodium=$(dpkg-query -W -f='${Version}' libsodium-dev 2>/dev/null || true)"
+            echo "test_type=correctness-smoke-test"
+            echo "performance_data_generated=no"
+          } > garg_flexbe_environment.txt
+
+          if [ -x garg-venv/bin/python ]; then
+            {
+              echo
+              echo "=== Python packages ==="
+              garg-venv/bin/python -m pip freeze
+            } >> garg_flexbe_environment.txt
+          fi
+
+      - name: Enforce Garg correctness gate
+        shell: bash
+        run: |
+          test -s garg_flexbe_test.log
+
+          if grep -Eiq \
+            'traceback|assertionerror|segmentation fault|core dumped|(^|[^a-z])failed([^a-z]|$)|(^|[^a-z])error([^a-z]|$)' \
+            garg_flexbe_test.log; then
+
+            echo "GARG FLEXBE CORRECTNESS GATE FAILED"
+            echo "Failure/error pattern detected in official test output."
+            exit 1
+          fi
+
+          echo "GARG FLEXBE CORRECTNESS GATE PASSED"
+          echo "Official FlexBroadcast testscript.sh exited successfully."
+          echo "Repository revision:"
+          cd FlexBroadcast
+          git rev-parse HEAD
+
+      - name: Upload Garg smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garg-flexbe-smoke-evidence
+          path: |
+            garg_flexbe_test.log
+            garg_flexbe_environment.txt
+          if-no-files-found: warn
+          retention-days: 90
