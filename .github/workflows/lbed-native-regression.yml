@@ -1,0 +1,67 @@
+name: LBED native mcl correctness regression
+
+on:
+  workflow_dispatch:
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev libgmp-dev git
+
+      - name: Fetch native herumi mcl
+        run: |
+          git clone --depth 1 --recursive https://github.com/herumi/mcl.git "$RUNNER_TEMP/mcl"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        run: |
+          make -j2 MCL_FP_BIT=384 MCL_FR_BIT=256
+          test -f lib/libmcl.a
+
+      - name: Configure LBED harness
+        run: |
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build LBED harness
+        run: |
+          cmake --build build -j2
+
+      - name: Run native correctness regression
+        run: |
+          ./build/lbed_bench \
+            --reps 3 \
+            --warmup 2 \
+            --payload 1024 \
+            --t 10,25,50 \
+            | tee native_correctness_regression.csv
+
+      - name: Record environment
+        run: |
+          echo "date_utc=$(date -u +%FT%TZ)" > environment.txt
+          echo "runner_image=ubuntu-24.04" >> environment.txt
+          echo "cpu=$(lscpu | grep 'Model name' | head -1)" >> environment.txt
+          echo "cores=$(nproc)" >> environment.txt
+          echo "ram=$(free -h | awk '/Mem:/ {print $2}')" >> environment.txt
+          echo "compiler=$(g++ --version | head -1)" >> environment.txt
+          echo "cmake=$(cmake --version | head -1)" >> environment.txt
+          echo "openssl=$(openssl version)" >> environment.txt
+          echo "mcl_commit=$(git -C "$RUNNER_TEMP/mcl" rev-parse HEAD)" >> environment.txt
+
+      - name: Upload regression results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-native-correctness-regression
+          path: |
+            native_correctness_regression.csv
+            environment.txt
