@@ -19,14 +19,30 @@ jobs:
           lscpu | grep -E 'Model name|CPU\(s\)' || true
 
       - name: Install system dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y \
+
+          sudo apt-get install -y --no-install-recommends \
             build-essential \
             git \
             libsodium-dev \
             libgmp-dev \
-            libssl-dev
+            libssl-dev \
+            pkg-config \
+            libffi-dev
+
+          echo "=== Installed native dependencies ==="
+          dpkg-query -W \
+            build-essential \
+            git \
+            libsodium-dev \
+            libgmp-dev \
+            libssl-dev \
+            pkg-config \
+            libffi-dev
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -38,7 +54,6 @@ jobs:
           git clone https://github.com/RachitG54/FlexBroadcast.git FlexBroadcast
           cd FlexBroadcast
 
-          # Freeze the exact audited revision.
           git checkout 6c8e180d05de2e784437a0a4b191947d70b6c747
 
           echo "=== FlexBroadcast revision ==="
