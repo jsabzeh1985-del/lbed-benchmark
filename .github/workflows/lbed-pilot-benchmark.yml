@@ -1,0 +1,226 @@
+name: LBED pilot benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pilot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev libgmp-dev git python3
+
+      - name: Fetch native herumi mcl
+        run: |
+          git clone --depth 1 --recursive https://github.com/herumi/mcl.git "$RUNNER_TEMP/mcl"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        run: |
+          make -j2 MCL_FP_BIT=384 MCL_FR_BIT=256
+          test -f lib/libmcl.a
+
+      - name: Configure LBED harness
+        run: |
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build LBED harness
+        run: cmake --build build -j2
+
+      - name: Run pilot benchmark
+        run: |
+          ./build/lbed_bench \
+            --reps 30 \
+            --warmup 10 \
+            --payload 1024 \
+            --t 10,25,50,100,200 \
+            | tee lbed_pilot_raw.csv
+
+      - name: Enforce correctness gate and compute statistics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv, io, math, statistics
+
+          RAW = "lbed_pilot_raw.csv"
+          SUMMARY = "lbed_pilot_summary.csv"
+
+          METRICS = [
+              "offline_ms",
+              "poly_ms",
+              "group_ms",
+              "online_ms",
+              "decrypt_ms"
+          ]
+
+          EXPECTED_T = [10, 25, 50, 100, 200]
+          EXPECTED_REPS = 30
+
+          with open(RAW, encoding="utf-8") as f:
+              lines = f.readlines()
+
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.startswith("t,rep,")),
+              None
+          )
+
+          if start is None:
+              raise SystemExit(
+                  "Pilot gate FAILED: CSV header not found"
+              )
+
+          rows = list(
+              csv.DictReader(
+                  io.StringIO("".join(lines[start:]))
+              )
+          )
+
+          grouped = {t: [] for t in EXPECTED_T}
+
+          for row in rows:
+              t = int(row["t"])
+              if t in grouped:
+                  grouped[t].append(row)
+
+          problems = []
+
+          for t in EXPECTED_T:
+              rs = grouped[t]
+
+              if len(rs) != EXPECTED_REPS:
+                  problems.append(
+                      f"t={t}: expected {EXPECTED_REPS}, got {len(rs)}"
+                  )
+
+              if any(int(r["correct"]) != 1 for r in rs):
+                  problems.append(
+                      f"t={t}: correctness failure"
+                  )
+
+          if problems:
+              raise SystemExit(
+                  "Pilot gate FAILED: " + "; ".join(problems)
+              )
+
+          def pct(xs, p):
+              xs = sorted(xs)
+              pos = (len(xs) - 1) * p
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+
+              if lo == hi:
+                  return xs[lo]
+
+              w = pos - lo
+              return xs[lo] * (1 - w) + xs[hi] * w
+
+          fields = [
+              "t",
+              "metric",
+              "n",
+              "mean_ms",
+              "median_ms",
+              "sd_ms",
+              "q1_ms",
+              "q3_ms",
+              "iqr_ms",
+              "cv_percent",
+              "min_ms",
+              "max_ms"
+          ]
+
+          with open(
+              SUMMARY,
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as f:
+
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=fields
+              )
+
+              writer.writeheader()
+
+              for t in EXPECTED_T:
+                  for metric in METRICS:
+
+                      xs = [
+                          float(r[metric])
+                          for r in grouped[t]
+                      ]
+
+                      mean = statistics.mean(xs)
+                      median = statistics.median(xs)
+                      sd = statistics.stdev(xs)
+
+                      q1 = pct(xs, 0.25)
+                      q3 = pct(xs, 0.75)
+
+                      cv = (
+                          sd / mean * 100
+                          if mean
+                          else float("nan")
+                      )
+
+                      writer.writerow({
+                          "t": t,
+                          "metric": metric,
+                          "n": len(xs),
+                          "mean_ms": f"{mean:.9f}",
+                          "median_ms": f"{median:.9f}",
+                          "sd_ms": f"{sd:.9f}",
+                          "q1_ms": f"{q1:.9f}",
+                          "q3_ms": f"{q3:.9f}",
+                          "iqr_ms": f"{q3-q1:.9f}",
+                          "cv_percent": f"{cv:.6f}",
+                          "min_ms": f"{min(xs):.9f}",
+                          "max_ms": f"{max(xs):.9f}"
+                      })
+
+          print("PILOT CORRECTNESS GATE PASSED")
+          print("No outliers were removed.")
+          PY
+
+      - name: Record environment and protocol
+        run: |
+          {
+            echo "date_utc=$(date -u +%FT%TZ)"
+            echo "runner_image=ubuntu-24.04"
+            echo "cpu=$(lscpu | grep 'Model name' | head -1 | cut -d: -f2- | xargs)"
+            echo "cores=$(nproc)"
+            echo "ram=$(free -h | awk '/Mem:/ {print $2}')"
+            echo "kernel=$(uname -a)"
+            echo "compiler=$(g++ --version | head -1)"
+            echo "cmake=$(cmake --version | head -1)"
+            echo "openssl=$(openssl version)"
+            echo "mcl_commit=$(git -C "$RUNNER_TEMP/mcl" rev-parse HEAD)"
+            echo "curve=BLS12-381"
+            echo "pairing=Type-3"
+            echo "payload_bytes=1024"
+            echo "warmup=10"
+            echo "repetitions=30"
+            echo "t_values=10,25,50,100,200"
+            echo "outlier_policy=no removal in pilot"
+          } | tee lbed_pilot_environment.txt
+
+      - name: Upload pilot artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-pilot-benchmark
+          path: |
+            lbed_pilot_raw.csv
+            lbed_pilot_summary.csv
+            lbed_pilot_environment.txt
+          if-no-files-found: error
