@@ -1,0 +1,232 @@
+name: LBED full benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  full-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev libgmp-dev git python3
+
+      - name: Fetch native herumi mcl
+        run: |
+          git clone --depth 1 --recursive https://github.com/herumi/mcl.git "$RUNNER_TEMP/mcl"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        run: |
+          make -j2 MCL_FP_BIT=384 MCL_FR_BIT=256
+          test -f lib/libmcl.a
+
+      - name: Configure LBED harness
+        run: |
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build LBED harness
+        run: cmake --build build -j2
+
+      - name: Run full benchmark
+        run: |
+          ./build/lbed_bench \
+            --reps 100 \
+            --warmup 10 \
+            --payload 1024 \
+            --t 10,25,50,100,200 \
+            | tee lbed_full_raw.csv
+
+      - name: Enforce correctness gate and compute statistics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import math
+          import statistics
+
+          RAW = "lbed_full_raw.csv"
+          SUMMARY = "lbed_full_summary.csv"
+
+          METRICS = [
+              "offline_ms",
+              "poly_ms",
+              "group_ms",
+              "online_ms",
+              "decrypt_ms",
+          ]
+
+          EXPECTED_T = [10, 25, 50, 100, 200]
+          EXPECTED_REPS = 100
+
+          with open(RAW, encoding="utf-8") as f:
+              lines = f.readlines()
+
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.startswith("t,rep,")),
+              None,
+          )
+
+          if start is None:
+              raise SystemExit("CSV header not found in benchmark output")
+
+          rows = list(csv.DictReader(lines[start:]))
+
+          if not rows:
+              raise SystemExit("No benchmark rows found")
+
+          expected_total = len(EXPECTED_T) * EXPECTED_REPS
+
+          if len(rows) != expected_total:
+              raise SystemExit(
+                  f"Unexpected row count: {len(rows)} "
+                  f"(expected {expected_total})"
+              )
+
+          bad_correctness = [
+              r for r in rows
+              if str(r.get("correct", "")).strip() != "1"
+          ]
+
+          if bad_correctness:
+              raise SystemExit(
+                  f"Correctness gate failed: "
+                  f"{len(bad_correctness)} incorrect rows"
+              )
+
+          for t in EXPECTED_T:
+              subset = [r for r in rows if int(r["t"]) == t]
+
+              if len(subset) != EXPECTED_REPS:
+                  raise SystemExit(
+                      f"t={t}: found {len(subset)} rows, "
+                      f"expected {EXPECTED_REPS}"
+                  )
+
+              reps = sorted(int(r["rep"]) for r in subset)
+
+              if reps != list(range(EXPECTED_REPS)):
+                  raise SystemExit(
+                      f"t={t}: repetition indices are incomplete"
+                  )
+
+          summary_rows = []
+
+          for t in EXPECTED_T:
+              subset = [r for r in rows if int(r["t"]) == t]
+
+              for metric in METRICS:
+                  values = [float(r[metric]) for r in subset]
+
+                  if any(not math.isfinite(v) for v in values):
+                      raise SystemExit(
+                          f"Non-finite value detected: "
+                          f"t={t}, metric={metric}"
+                      )
+
+                  values_sorted = sorted(values)
+                  n = len(values_sorted)
+
+                  mean = statistics.mean(values_sorted)
+                  median = statistics.median(values_sorted)
+                  stdev = (
+                      statistics.stdev(values_sorted)
+                      if n > 1 else 0.0
+                  )
+
+                  def percentile(p):
+                      pos = (n - 1) * p
+                      lo = math.floor(pos)
+                      hi = math.ceil(pos)
+
+                      if lo == hi:
+                          return values_sorted[lo]
+
+                      return (
+                          values_sorted[lo] * (hi - pos)
+                          + values_sorted[hi] * (pos - lo)
+                      )
+
+                  summary_rows.append({
+                      "t": t,
+                      "metric": metric,
+                      "n": n,
+                      "mean_ms": mean,
+                      "median_ms": median,
+                      "stdev_ms": stdev,
+                      "p95_ms": percentile(0.95),
+                      "min_ms": min(values_sorted),
+                      "max_ms": max(values_sorted),
+                  })
+
+          with open(
+              SUMMARY,
+              "w",
+              newline="",
+              encoding="utf-8",
+          ) as f:
+              fieldnames = [
+                  "t",
+                  "metric",
+                  "n",
+                  "mean_ms",
+                  "median_ms",
+                  "stdev_ms",
+                  "p95_ms",
+                  "min_ms",
+                  "max_ms",
+              ]
+
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=fieldnames,
+              )
+
+              writer.writeheader()
+              writer.writerows(summary_rows)
+
+          print("FULL BENCHMARK CORRECTNESS GATE PASSED")
+          print(f"Validated rows: {len(rows)}")
+          print(f"Repetitions per t: {EXPECTED_REPS}")
+          print("No benchmark rows were removed.")
+          PY
+
+      - name: Record environment and protocol
+        shell: bash
+        run: |
+          {
+            echo "LBED full benchmark"
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "commit=$GITHUB_SHA"
+            echo "compiler=$(c++ --version | head -n 1)"
+            echo "cmake=$(cmake --version | head -n 1)"
+            echo "curve=BLS12-381"
+            echo "library=mcl"
+            echo "mode=single-threaded"
+            echo "repetitions=100"
+            echo "warmup=10"
+            echo "payload_bytes=1024"
+            echo "t_values=10,25,50,100,200"
+          } > lbed_full_environment.txt
+
+      - name: Upload full benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-full-benchmark-results
+          path: |
+            lbed_full_raw.csv
+            lbed_full_summary.csv
+            lbed_full_environment.txt
+          if-no-files-found: error
+          retention-days: 90
