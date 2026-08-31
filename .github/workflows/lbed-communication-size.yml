@@ -17,9 +17,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          sha256sum lbed_benchmark.cpp \
-            > lbed_original_source_sha256.txt
-
+          sha256sum lbed_benchmark.cpp > lbed_original_source_sha256.txt
           cat lbed_original_source_sha256.txt
 
       - name: Instrument LBED communication serialization
@@ -27,8 +25,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          cp lbed_benchmark.cpp \
-            lbed_benchmark_original.cpp
+          cp lbed_benchmark.cpp lbed_benchmark_original.cpp
 
           python3 - <<'PY'
           from pathlib import Path
@@ -40,8 +37,7 @@ jobs:
           ).replace("\r\n", "\n")
 
           # -------------------------------------------------
-          # 1. Insert canonical full-record serialization
-          #    immediately before encode_ctx().
+          # Insert serialization helpers before encode_ctx().
           # -------------------------------------------------
 
           marker = (
@@ -51,8 +47,7 @@ jobs:
 
           if src.count(marker) != 1:
               raise SystemExit(
-                  "ERROR: encode_ctx insertion "
-                  "marker mismatch"
+                  "ERROR: encode_ctx insertion marker mismatch"
               )
 
           helper = r'''
@@ -75,19 +70,10 @@ jobs:
                   c.sensor_id.end()
               );
 
-              append_u64(
-                  out,
-                  c.epoch
-              );
+              append_u64(out, c.epoch);
+              append_u64(out, c.seq);
 
-              append_u64(
-                  out,
-                  c.seq
-              );
-
-              auto hb = encode_header(
-                  c.hdr
-              );
+              auto hb = encode_header(c.hdr);
 
               append_u64(
                   out,
@@ -148,9 +134,7 @@ jobs:
               const Ciphertext& c)
           {
               return
-                  encode_header(
-                      c.hdr
-                  ).size()
+                  encode_header(c.hdr).size()
                   + KEY_BYTES
                   + NONCE_BYTES
                   + TAG_BYTES;
@@ -165,7 +149,7 @@ jobs:
           )
 
           # -------------------------------------------------
-          # 2. Update CSV column descriptions.
+          # Update human-readable column description.
           # -------------------------------------------------
 
           old_comment = (
@@ -186,8 +170,7 @@ jobs:
 
           if src.count(old_comment) != 1:
               raise SystemExit(
-                  "ERROR: benchmark comment "
-                  "header mismatch"
+                  "ERROR: benchmark comment header mismatch"
               )
 
           src = src.replace(
@@ -195,6 +178,10 @@ jobs:
               new_comment,
               1
           )
+
+          # -------------------------------------------------
+          # Update actual CSV header.
+          # -------------------------------------------------
 
           old_csv = (
               't,rep,offline_ms,poly_ms,'
@@ -212,8 +199,7 @@ jobs:
 
           if src.count(old_csv) != 1:
               raise SystemExit(
-                  "ERROR: benchmark CSV "
-                  "header mismatch"
+                  "ERROR: benchmark CSV header mismatch"
               )
 
           src = src.replace(
@@ -223,9 +209,7 @@ jobs:
           )
 
           # -------------------------------------------------
-          # 3. Robust line-based output instrumentation.
-          #    This deliberately avoids whitespace-sensitive
-          #    multi-line matching.
+          # Instrument result output robustly.
           # -------------------------------------------------
 
           lines = src.splitlines()
@@ -233,39 +217,25 @@ jobs:
           target_index = None
 
           for i, line in enumerate(lines):
-              if (
-                  "<< ms_since(c0,c1)"
-                  in line
-              ):
+              if "<< ms_since(c0,c1)" in line:
                   target_index = i
                   break
 
           if target_index is None:
               raise SystemExit(
-                  "ERROR: decrypt timing "
-                  "output line not found"
+                  "ERROR: decrypt timing output line not found"
               )
 
-          if (
-              target_index + 1
-              >= len(lines)
-          ):
+          if target_index + 1 >= len(lines):
               raise SystemExit(
-                  "ERROR: incomplete output row"
+                  "ERROR: incomplete benchmark output row"
               )
 
-          next_line = lines[
-              target_index + 1
-          ]
+          next_line = lines[target_index + 1]
 
-          if (
-              "<< (ok ? 1 : 0)"
-              not in next_line
-          ):
+          if "<< (ok ? 1 : 0)" not in next_line:
               raise SystemExit(
-                  "ERROR: correctness output "
-                  "line not found after "
-                  "decrypt timing"
+                  "ERROR: correctness output line not found"
               )
 
           indent = (
@@ -278,21 +248,18 @@ jobs:
           inserted = [
               (
                   indent
-                  + "<< encode_header("
-                  + "ct.hdr).size() "
+                  + "<< encode_header(ct.hdr).size() "
                   + "<< \",\""
               ),
               (
                   indent
-                  + "<< "
-                  + "cryptographic_overhead_size("
-                  + "ct) << \",\""
+                  + "<< cryptographic_overhead_size(ct) "
+                  + "<< \",\""
               ),
               (
                   indent
-                  + "<< "
-                  + "encode_ciphertext_for_size("
-                  + "ct).size() << \",\""
+                  + "<< encode_ciphertext_for_size(ct).size() "
+                  + "<< \",\""
               ),
           ]
 
@@ -309,25 +276,13 @@ jobs:
           )
 
           print(
-              "LBED COMMUNICATION "
-              "INSTRUMENTATION PATCH APPLIED"
+              "LBED COMMUNICATION INSTRUMENTATION PATCH APPLIED"
           )
 
-          print(
-              "Added metrics:"
-          )
-
-          print(
-              "  header_bytes"
-          )
-
-          print(
-              "  crypto_overhead_bytes"
-          )
-
-          print(
-              "  wire_bytes"
-          )
+          print("Added metrics:")
+          print("  header_bytes")
+          print("  crypto_overhead_bytes")
+          print("  wire_bytes")
           PY
 
           diff -u \
@@ -336,13 +291,10 @@ jobs:
             > lbed_communication_instrumentation.patch \
             || true
 
-          test -s \
-            lbed_communication_instrumentation.patch
+          test -s lbed_communication_instrumentation.patch
 
           echo "=== Instrumentation patch ==="
-
-          cat \
-            lbed_communication_instrumentation.patch
+          cat lbed_communication_instrumentation.patch
 
           sha256sum lbed_benchmark.cpp \
             > lbed_instrumented_source_sha256.txt
@@ -383,8 +335,7 @@ jobs:
           git rev-parse HEAD \
             > "$GITHUB_WORKSPACE/mcl_commit.txt"
 
-          cat \
-            "$GITHUB_WORKSPACE/mcl_commit.txt"
+          cat "$GITHUB_WORKSPACE/mcl_commit.txt"
 
       - name: Build native mcl
         working-directory: ${{ runner.temp }}/mcl
@@ -455,7 +406,6 @@ jobs:
           ]
 
           EXPECTED_REPS = 5
-
           PAYLOAD_BYTES = 1024
 
           lines = RAW.read_text(
@@ -467,17 +417,14 @@ jobs:
                   i
                   for i, line
                   in enumerate(lines)
-                  if line.startswith(
-                      "t,rep,"
-                  )
+                  if line.startswith("t,rep,")
               ),
               None
           )
 
           if start is None:
               raise SystemExit(
-                  "ERROR: CSV header "
-                  "not found"
+                  "ERROR: CSV header not found"
               )
 
           rows = list(
@@ -493,8 +440,7 @@ jobs:
 
           if len(rows) != expected_rows:
               raise SystemExit(
-                  f"ERROR: expected "
-                  f"{expected_rows} rows, "
+                  f"ERROR: expected {expected_rows} rows, "
                   f"got {len(rows)}"
               )
 
@@ -504,24 +450,16 @@ jobs:
           }
 
           for row in rows:
-              t = int(
-                  row["t"]
-              )
+              t = int(row["t"])
 
               if t not in grouped:
                   raise SystemExit(
-                      f"ERROR: unexpected "
-                      f"t={t}"
+                      f"ERROR: unexpected t={t}"
                   )
 
-              if (
-                  row["correct"]
-                  .strip()
-                  != "1"
-              ):
+              if row["correct"].strip() != "1":
                   raise SystemExit(
-                      f"ERROR: correctness "
-                      f"failure at t={t}"
+                      f"ERROR: correctness failure at t={t}"
                   )
 
               hb = int(
@@ -529,9 +467,7 @@ jobs:
               )
 
               cob = int(
-                  row[
-                      "crypto_overhead_bytes"
-                  ]
+                  row["crypto_overhead_bytes"]
               )
 
               wb = int(
@@ -540,25 +476,21 @@ jobs:
 
               if hb <= 0:
                   raise SystemExit(
-                      f"ERROR: invalid "
-                      f"header size at t={t}"
+                      f"ERROR: invalid header size at t={t}"
                   )
 
               if cob <= hb:
                   raise SystemExit(
-                      f"ERROR: invalid crypto "
+                      f"ERROR: invalid cryptographic "
                       f"overhead at t={t}"
                   )
 
               if wb <= cob:
                   raise SystemExit(
-                      f"ERROR: invalid wire "
-                      f"size at t={t}"
+                      f"ERROR: invalid wire size at t={t}"
                   )
 
-              grouped[t].append(
-                  row
-              )
+              grouped[t].append(row)
 
           fields = [
               "t",
@@ -587,78 +519,47 @@ jobs:
               for t in EXPECTED_T:
                   group = grouped[t]
 
-                  if (
-                      len(group)
-                      != EXPECTED_REPS
-                  ):
+                  if len(group) != EXPECTED_REPS:
                       raise SystemExit(
-                          f"ERROR: t={t} "
-                          f"has "
+                          f"ERROR: t={t} has "
                           f"{len(group)} rows"
                       )
 
                   header_sizes = {
-                      int(
-                          r["header_bytes"]
-                      )
+                      int(r["header_bytes"])
                       for r in group
                   }
 
                   crypto_sizes = {
                       int(
-                          r[
-                              "crypto_overhead_bytes"
-                          ]
+                          r["crypto_overhead_bytes"]
                       )
                       for r in group
                   }
 
                   wire_sizes = {
-                      int(
-                          r["wire_bytes"]
-                      )
+                      int(r["wire_bytes"])
                       for r in group
                   }
 
-                  if (
-                      len(header_sizes)
-                      != 1
-                  ):
+                  if len(header_sizes) != 1:
                       raise SystemExit(
-                          f"ERROR: header size "
-                          f"varied at t={t}"
+                          f"ERROR: header size varied at t={t}"
                       )
 
-                  if (
-                      len(crypto_sizes)
-                      != 1
-                  ):
+                  if len(crypto_sizes) != 1:
                       raise SystemExit(
-                          f"ERROR: crypto "
-                          f"overhead varied "
-                          f"at t={t}"
+                          f"ERROR: crypto overhead varied at t={t}"
                       )
 
-                  if (
-                      len(wire_sizes)
-                      != 1
-                  ):
+                  if len(wire_sizes) != 1:
                       raise SystemExit(
-                          f"ERROR: wire size "
-                          f"varied at t={t}"
+                          f"ERROR: wire size varied at t={t}"
                       )
 
-                  hb = next(
-                      iter(header_sizes)
-                  )
-
-                  cob = next(
-                      iter(crypto_sizes)
-                  )
-
-                  wb = next(
-                      iter(wire_sizes)
-                  )
+                  hb = next(iter(header_sizes))
+                  cob = next(iter(crypto_sizes))
+                  wb = next(iter(wire_sizes))
 
                   writer.writerow({
                       "t":
@@ -682,53 +583,47 @@ jobs:
                   })
 
           print(
-              "LBED COMMUNICATION SIZE "
-              "DATASET PASSED"
+              "LBED COMMUNICATION SIZE DATASET PASSED"
           )
 
           print(
-              f"Recipient-set sizes: "
-              f"{EXPECTED_T}"
+              f"Recipient-set sizes: {EXPECTED_T}"
           )
 
           print(
-              f"Measurements per t: "
-              f"{EXPECTED_REPS}"
+              f"Measurements per t: {EXPECTED_REPS}"
           )
 
           print(
-              f"Validated rows: "
-              f"{len(rows)}"
+              f"Validated rows: {len(rows)}"
           )
 
           for t in EXPECTED_T:
               r = grouped[t][0]
 
               print(
-                  "t="
-                  f"{t}: "
-                  "header="
-                  f"{r['header_bytes']} B, "
-                  "crypto_overhead="
+                  f"t={t}: "
+                  f"header={r['header_bytes']} B, "
+                  f"crypto_overhead="
                   f"{r['crypto_overhead_bytes']} B, "
-                  "wire="
-                  f"{r['wire_bytes']} B"
+                  f"wire={r['wire_bytes']} B"
               )
 
           print(
-              "Serialized sizes were "
-              "invariant across repetitions."
+              "Serialized sizes were invariant "
+              "across repetitions."
           )
 
           print(
-              "No communication rows "
-              "were removed."
+              "No communication rows were removed."
           )
           PY
 
       - name: Record communication protocol
         shell: bash
         run: |
+          set -euo pipefail
+
           {
             echo "scheme=LBED"
             echo "measurement=serialized_communication_size"
@@ -763,27 +658,49 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -s \
-            lbed_communication_raw.csv
+          test -s lbed_communication_raw.csv
+          test -s lbed_communication_summary.csv
+          test -s lbed_communication_protocol.txt
+          test -s lbed_communication_instrumentation.patch
+          test -s lbed_original_source_sha256.txt
+          test -s lbed_instrumented_source_sha256.txt
+          test -s mcl_commit.txt
 
-          test -s \
-            lbed_communication_summary.csv
+          SUMMARY_ROWS="$(tail -n +2 lbed_communication_summary.csv | wc -l | tr -d ' ')"
 
-          test -s \
-            lbed_communication_protocol.txt
-
-          test -s \
-            lbed_communication_instrumentation.patch
-
-          SUMMARY_ROWS=$(
-            tail -n +2 \
-              lbed_communication_summary.csv |
-            wc -l
-          )
+          echo "Observed summary rows: ${SUMMARY_ROWS}"
 
           if [ "${SUMMARY_ROWS}" -ne 6 ]; then
-            echo \
-              "ERROR: expected 6 "
-              "summary rows"
+            echo "ERROR: expected 6 summary rows"
+            exit 1
+          fi
 
-            ec
+          grep -q '^32,' lbed_communication_summary.csv
+          grep -q '^64,' lbed_communication_summary.csv
+          grep -q '^128,' lbed_communication_summary.csv
+          grep -q '^256,' lbed_communication_summary.csv
+          grep -q '^512,' lbed_communication_summary.csv
+          grep -q '^1024,' lbed_communication_summary.csv
+
+          echo "LBED COMMUNICATION EVIDENCE GATE PASSED"
+          echo "Recipient-set sizes: 32,64,128,256,512,1024"
+          echo "Summary rows: ${SUMMARY_ROWS}"
+          echo "Header, cryptographic overhead, and full wire sizes recorded."
+          echo "No communication measurements were removed."
+
+      - name: Upload LBED communication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-communication-size-results
+          path: |
+            lbed_communication_raw.csv
+            lbed_communication_summary.csv
+            lbed_communication_protocol.txt
+            lbed_communication_instrumentation.patch
+            lbed_original_source_sha256.txt
+            lbed_instrumented_source_sha256.txt
+            mcl_commit.txt
+            lbed_benchmark.cpp
+          if-no-files-found: warn
+          retention-days: 90
