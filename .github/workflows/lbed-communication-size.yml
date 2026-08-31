@@ -1,0 +1,623 @@
+name: LBED communication size benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  communication-size:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Record original source hash
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sha256sum lbed_benchmark.cpp \
+            > lbed_original_source_sha256.txt
+
+          cat lbed_original_source_sha256.txt
+
+      - name: Instrument canonical ciphertext serialization
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp lbed_benchmark.cpp \
+            lbed_benchmark_original.cpp
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("lbed_benchmark.cpp")
+          src = path.read_text(encoding="utf-8")
+
+          marker = (
+              "static std::vector<unsigned char> "
+              "serialize_gt(const GT& x) {"
+          )
+
+          if src.count(marker) != 1:
+              raise SystemExit(
+                  "ERROR: serialize_gt insertion marker "
+                  "not found exactly once"
+              )
+
+          helper = r'''
+          static std::vector<unsigned char>
+          encode_ciphertext_for_size(const Ciphertext& c)
+          {
+              std::vector<unsigned char> out;
+
+              append_u64(
+                  out,
+                  static_cast<uint64_t>(
+                      c.sensor_id.size()
+                  )
+              );
+
+              out.insert(
+                  out.end(),
+                  c.sensor_id.begin(),
+                  c.sensor_id.end()
+              );
+
+              append_u64(out, c.epoch);
+              append_u64(out, c.seq);
+
+              auto hb = encode_header(c.hdr);
+
+              append_u64(
+                  out,
+                  static_cast<uint64_t>(
+                      hb.size()
+                  )
+              );
+
+              out.insert(
+                  out.end(),
+                  hb.begin(),
+                  hb.end()
+              );
+
+              out.insert(
+                  out.end(),
+                  c.wrapped_key.begin(),
+                  c.wrapped_key.end()
+              );
+
+              out.insert(
+                  out.end(),
+                  c.nonce.begin(),
+                  c.nonce.end()
+              );
+
+              append_u64(
+                  out,
+                  static_cast<uint64_t>(
+                      c.aead_ct.size()
+                  )
+              );
+
+              out.insert(
+                  out.end(),
+                  c.aead_ct.begin(),
+                  c.aead_ct.end()
+              );
+
+              append_u64(
+                  out,
+                  static_cast<uint64_t>(
+                      c.aad_app.size()
+                  )
+              );
+
+              out.insert(
+                  out.end(),
+                  c.aad_app.begin(),
+                  c.aad_app.end()
+              );
+
+              return out;
+          }
+
+          '''
+
+          src = src.replace(
+              marker,
+              helper + marker
+          )
+
+          old_header_comment = (
+              '# columns: '
+              't,rep,offline_ms,poly_ms,group_ms,'
+              'online_ms,decrypt_ms,correct'
+          )
+
+          new_header_comment = (
+              '# columns: '
+              't,rep,offline_ms,poly_ms,group_ms,'
+              'online_ms,decrypt_ms,'
+              'header_bytes,ciphertext_bytes,correct'
+          )
+
+          if src.count(old_header_comment) != 1:
+              raise SystemExit(
+                  "ERROR: comment header marker mismatch"
+              )
+
+          src = src.replace(
+              old_header_comment,
+              new_header_comment
+          )
+
+          old_csv_header = (
+              't,rep,offline_ms,poly_ms,group_ms,'
+              'online_ms,decrypt_ms,correct'
+          )
+
+          new_csv_header = (
+              't,rep,offline_ms,poly_ms,group_ms,'
+              'online_ms,decrypt_ms,'
+              'header_bytes,ciphertext_bytes,correct'
+          )
+
+          if src.count(old_csv_header) != 1:
+              raise SystemExit(
+                  "ERROR: CSV header marker mismatch"
+              )
+
+          src = src.replace(
+              old_csv_header,
+              new_csv_header
+          )
+
+          old_output = '''                      << ms_since(c0,c1) << ","
+                      << (ok ? 1 : 0) << "\\n";'''
+
+          new_output = '''                      << ms_since(c0,c1) << ","
+                      << encode_header(ct.hdr).size() << ","
+                      << encode_ciphertext_for_size(ct).size() << ","
+                      << (ok ? 1 : 0) << "\\n";'''
+
+          if src.count(old_output) != 1:
+              raise SystemExit(
+                  "ERROR: output-row marker mismatch"
+              )
+
+          src = src.replace(
+              old_output,
+              new_output
+          )
+
+          path.write_text(
+              src,
+              encoding="utf-8"
+          )
+
+          print(
+              "LBED COMMUNICATION "
+              "INSTRUMENTATION PATCH APPLIED"
+          )
+          PY
+
+          diff -u \
+            lbed_benchmark_original.cpp \
+            lbed_benchmark.cpp \
+            > lbed_communication_instrumentation.patch \
+            || true
+
+          test -s \
+            lbed_communication_instrumentation.patch
+
+          echo "=== Instrumentation patch ==="
+          cat lbed_communication_instrumentation.patch
+
+          sha256sum lbed_benchmark.cpp \
+            > lbed_instrumented_source_sha256.txt
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libssl-dev \
+            libgmp-dev \
+            git \
+            python3
+
+      - name: Fetch native herumi mcl
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --recursive \
+            https://github.com/herumi/mcl.git \
+            "$RUNNER_TEMP/mcl"
+
+      - name: Record mcl revision
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$RUNNER_TEMP/mcl"
+
+          git rev-parse HEAD \
+            > "$GITHUB_WORKSPACE/mcl_commit.txt"
+
+          cat "$GITHUB_WORKSPACE/mcl_commit.txt"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          make -j2 \
+            MCL_FP_BIT=384 \
+            MCL_FR_BIT=256
+
+          test -f lib/libmcl.a
+
+      - name: Configure instrumented LBED harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build instrumented LBED harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake --build build -j2
+
+          test -x build/lbed_bench
+
+      - name: Run LBED communication measurements
+        shell: bash
+        run: |
+          set -o pipefail
+
+          ./build/lbed_bench \
+            --reps 5 \
+            --warmup 2 \
+            --payload 1024 \
+            --t 32,64,128,256,512,1024 \
+          | tee lbed_communication_raw.csv
+
+      - name: Validate and summarize communication sizes
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          RAW = Path(
+              "lbed_communication_raw.csv"
+          )
+
+          SUMMARY = Path(
+              "lbed_communication_summary.csv"
+          )
+
+          EXPECTED_T = [
+              32,
+              64,
+              128,
+              256,
+              512,
+              1024,
+          ]
+
+          EXPECTED_REPS = 5
+          PAYLOAD_BYTES = 1024
+
+          lines = RAW.read_text(
+              encoding="utf-8"
+          ).splitlines()
+
+          start = next(
+              (
+                  i
+                  for i, line in enumerate(lines)
+                  if line.startswith("t,rep,")
+              ),
+              None
+          )
+
+          if start is None:
+              raise SystemExit(
+                  "ERROR: CSV header not found"
+              )
+
+          rows = list(
+              csv.DictReader(
+                  lines[start:]
+              )
+          )
+
+          expected_rows = (
+              len(EXPECTED_T)
+              * EXPECTED_REPS
+          )
+
+          if len(rows) != expected_rows:
+              raise SystemExit(
+                  f"ERROR: expected "
+                  f"{expected_rows} rows, "
+                  f"got {len(rows)}"
+              )
+
+          grouped = {
+              t: []
+              for t in EXPECTED_T
+          }
+
+          for row in rows:
+              t = int(row["t"])
+
+              if t not in grouped:
+                  raise SystemExit(
+                      f"ERROR: unexpected t={t}"
+                  )
+
+              if row["correct"].strip() != "1":
+                  raise SystemExit(
+                      f"ERROR: correctness "
+                      f"failure at t={t}"
+                  )
+
+              header_bytes = int(
+                  row["header_bytes"]
+              )
+
+              ciphertext_bytes = int(
+                  row["ciphertext_bytes"]
+              )
+
+              if header_bytes <= 0:
+                  raise SystemExit(
+                      f"ERROR: invalid "
+                      f"header_bytes={header_bytes}"
+                  )
+
+              if ciphertext_bytes <= header_bytes:
+                  raise SystemExit(
+                      f"ERROR: invalid "
+                      f"ciphertext_bytes="
+                      f"{ciphertext_bytes}"
+                  )
+
+              grouped[t].append(row)
+
+          fields = [
+              "t",
+              "n",
+              "header_bytes",
+              "ciphertext_bytes",
+              "payload_bytes",
+              "header_to_payload_percent",
+              "total_over_payload_percent",
+          ]
+
+          with SUMMARY.open(
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=fields
+              )
+
+              writer.writeheader()
+
+              for t in EXPECTED_T:
+                  group = grouped[t]
+
+                  if (
+                      len(group)
+                      != EXPECTED_REPS
+                  ):
+                      raise SystemExit(
+                          f"ERROR: t={t} has "
+                          f"{len(group)} rows"
+                      )
+
+                  header_sizes = {
+                      int(
+                          r["header_bytes"]
+                      )
+                      for r in group
+                  }
+
+                  ciphertext_sizes = {
+                      int(
+                          r["ciphertext_bytes"]
+                      )
+                      for r in group
+                  }
+
+                  if len(header_sizes) != 1:
+                      raise SystemExit(
+                          f"ERROR: header size "
+                          f"varied at t={t}"
+                      )
+
+                  if (
+                      len(ciphertext_sizes)
+                      != 1
+                  ):
+                      raise SystemExit(
+                          f"ERROR: ciphertext "
+                          f"size varied at t={t}"
+                      )
+
+                  hb = next(
+                      iter(header_sizes)
+                  )
+
+                  cb = next(
+                      iter(ciphertext_sizes)
+                  )
+
+                  writer.writerow({
+                      "t":
+                          t,
+                      "n":
+                          EXPECTED_REPS,
+                      "header_bytes":
+                          hb,
+                      "ciphertext_bytes":
+                          cb,
+                      "payload_bytes":
+                          PAYLOAD_BYTES,
+                      "header_to_payload_percent":
+                          f"{100.0 * hb / PAYLOAD_BYTES:.6f}",
+                      "total_over_payload_percent":
+                          f"{100.0 * cb / PAYLOAD_BYTES:.6f}",
+                  })
+
+          print(
+              "LBED COMMUNICATION SIZE "
+              "DATASET PASSED"
+          )
+
+          print(
+              f"Recipient-set sizes: "
+              f"{EXPECTED_T}"
+          )
+
+          print(
+              f"Measurements per t: "
+              f"{EXPECTED_REPS}"
+          )
+
+          print(
+              f"Validated rows: "
+              f"{len(rows)}"
+          )
+
+          print(
+              "Serialized sizes were "
+              "invariant across repetitions."
+          )
+
+          print(
+              "No communication rows "
+              "were removed."
+          )
+          PY
+
+      - name: Record communication protocol
+        shell: bash
+        run: |
+          {
+            echo "scheme=LBED"
+            echo "measurement=serialized_communication_size"
+            echo "curve=BLS12-381"
+            echo "library=herumi-mcl"
+            echo "mode=single-threaded"
+            echo "build_type=Release"
+            echo "payload_bytes=1024"
+            echo "t_values=32,64,128,256,512,1024"
+            echo "measurements_per_t=5"
+            echo "warmup_repetitions=2"
+            echo "outlier_removal=none"
+            echo "header_encoding=existing_encode_header"
+            echo "ciphertext_encoding=canonical_benchmark_serialization"
+            echo "ciphertext_fields=sensor_id,epoch,seq,header,wrapped_key,nonce,aead_ciphertext,aad_app"
+            echo "integer_lengths=8_byte_big_endian"
+            echo "source_modification=pipeline_local_only"
+            echo "repository_source_not_overwritten=yes"
+            echo "mcl_commit=$(cat mcl_commit.txt)"
+            echo "original_source_sha256=$(awk '{print $1}' lbed_original_source_sha256.txt)"
+            echo "instrumented_source_sha256=$(awk '{print $1}' lbed_instrumented_source_sha256.txt)"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
+            echo "compiler=$(c++ --version | head -1)"
+          } > lbed_communication_protocol.txt
+
+      - name: Enforce communication evidence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s \
+            lbed_communication_raw.csv
+
+          test -s \
+            lbed_communication_summary.csv
+
+          test -s \
+            lbed_communication_protocol.txt
+
+          test -s \
+            lbed_communication_instrumentation.patch
+
+          SUMMARY_ROWS=$(
+            tail -n +2 \
+              lbed_communication_summary.csv |
+            wc -l
+          )
+
+          if [ "${SUMMARY_ROWS}" -ne 6 ]; then
+            echo \
+              "ERROR: expected 6 summary rows"
+
+            echo \
+              "Observed: ${SUMMARY_ROWS}"
+
+            exit 1
+          fi
+
+          echo \
+            "LBED COMMUNICATION EVIDENCE GATE PASSED"
+
+          echo \
+            "Recipient-set sizes: 32,64,128,256,512,1024"
+
+          echo \
+            "Summary rows: ${SUMMARY_ROWS}"
+
+          echo \
+            "Canonical serialized header and ciphertext sizes recorded."
+
+          echo \
+            "No communication measurements were removed."
+
+      - name: Upload LBED communication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-communication-size-results
+          path: |
+            lbed_communication_raw.csv
+            lbed_communication_summary.csv
+            lbed_communication_protocol.txt
+            lbed_communication_instrumentation.patch
+            lbed_original_source_sha256.txt
+            lbed_instrumented_source_sha256.txt
+            mcl_commit.txt
+            lbed_benchmark.cpp
+          if-no-files-found: warn
+          retention-days: 90
