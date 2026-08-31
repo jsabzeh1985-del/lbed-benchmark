@@ -1,0 +1,418 @@
+name: LBED comparative grid benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  comparative-grid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout LBED repository
+        uses: actions/checkout@v4
+
+      - name: Record runner information
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=== GitHub Actions runner ==="
+          uname -a
+          lscpu
+          free -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libssl-dev \
+            libgmp-dev \
+            git \
+            python3
+
+      - name: Fetch native herumi mcl
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --recursive \
+            https://github.com/herumi/mcl.git \
+            "$RUNNER_TEMP/mcl"
+
+      - name: Build native mcl
+        working-directory: ${{ runner.temp }}/mcl
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          make -j2 \
+            MCL_FP_BIT=384 \
+            MCL_FR_BIT=256
+
+          test -f lib/libmcl.a
+
+      - name: Configure LBED harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake -S . -B build \
+            -DMCL_ROOT="$RUNNER_TEMP/mcl" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build LBED harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake --build build -j2
+
+          test -x build/lbed_bench
+
+      - name: Run LBED comparative benchmark
+        shell: bash
+        run: |
+          set -o pipefail
+
+          ./build/lbed_bench \
+            --reps 100 \
+            --warmup 10 \
+            --payload 1024 \
+            --t 32,64,128,256,512,1024 \
+          | tee lbed_comparative_raw.csv
+
+      - name: Build LBED comparative statistics
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import math
+          import statistics
+
+          RAW = "lbed_comparative_raw.csv"
+          SUMMARY = "lbed_comparative_summary.csv"
+
+          METRICS = [
+              "offline_ms",
+              "poly_ms",
+              "group_ms",
+              "online_ms",
+              "decrypt_ms",
+          ]
+
+          EXPECTED_T = [
+              32,
+              64,
+              128,
+              256,
+              512,
+              1024,
+          ]
+
+          EXPECTED_REPS = 100
+
+          with open(
+              RAW,
+              encoding="utf-8"
+          ) as f:
+              lines = f.readlines()
+
+          start = next(
+              (
+                  i
+                  for i, line in enumerate(lines)
+                  if line.startswith("t,rep,")
+              ),
+              None
+          )
+
+          if start is None:
+              raise SystemExit(
+                  "ERROR: CSV header not found"
+              )
+
+          rows = list(
+              csv.DictReader(
+                  lines[start:]
+              )
+          )
+
+          expected_rows = (
+              len(EXPECTED_T)
+              * EXPECTED_REPS
+          )
+
+          if len(rows) != expected_rows:
+              raise SystemExit(
+                  f"ERROR: expected "
+                  f"{expected_rows} rows, "
+                  f"got {len(rows)}"
+              )
+
+          grouped = {
+              t: []
+              for t in EXPECTED_T
+          }
+
+          for row in rows:
+              t = int(row["t"])
+              rep = int(row["rep"])
+
+              if t not in grouped:
+                  raise SystemExit(
+                      f"ERROR: unexpected t={t}"
+                  )
+
+              if (
+                  rep < 0
+                  or rep >= EXPECTED_REPS
+              ):
+                  raise SystemExit(
+                      f"ERROR: invalid repetition "
+                      f"index {rep} for t={t}"
+                  )
+
+              ok = str(
+                  row["correct"]
+              ).strip().lower()
+
+              if ok not in (
+                  "1",
+                  "true",
+                  "yes",
+              ):
+                  raise SystemExit(
+                      f"ERROR: correctness failure "
+                      f"at t={t}, rep={rep}"
+                  )
+
+              for metric in METRICS:
+                  value = float(
+                      row[metric]
+                  )
+
+                  if (
+                      not math.isfinite(value)
+                      or value < 0
+                  ):
+                      raise SystemExit(
+                          f"ERROR: invalid "
+                          f"{metric}={value} "
+                          f"at t={t}, rep={rep}"
+                      )
+
+              grouped[t].append(row)
+
+          for t in EXPECTED_T:
+              reps = [
+                  int(r["rep"])
+                  for r in grouped[t]
+              ]
+
+              if len(reps) != EXPECTED_REPS:
+                  raise SystemExit(
+                      f"ERROR: t={t} has "
+                      f"{len(reps)} rows; "
+                      f"expected {EXPECTED_REPS}"
+                  )
+
+              if (
+                  len(set(reps))
+                  != EXPECTED_REPS
+              ):
+                  raise SystemExit(
+                      f"ERROR: duplicate "
+                      f"repetition index "
+                      f"for t={t}"
+                  )
+
+          def percentile(values, p):
+              xs = sorted(values)
+
+              if len(xs) == 1:
+                  return xs[0]
+
+              pos = (
+                  len(xs) - 1
+              ) * p
+
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+
+              if lo == hi:
+                  return xs[lo]
+
+              return (
+                  xs[lo] * (hi - pos)
+                  + xs[hi] * (pos - lo)
+              )
+
+          fields = [
+              "t",
+              "metric",
+              "n",
+              "mean_ms",
+              "median_ms",
+              "sd_ms",
+              "p95_ms",
+              "min_ms",
+              "max_ms",
+          ]
+
+          with open(
+              SUMMARY,
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=fields
+              )
+
+              writer.writeheader()
+
+              for t in EXPECTED_T:
+                  for metric in METRICS:
+                      values = [
+                          float(r[metric])
+                          for r in grouped[t]
+                      ]
+
+                      writer.writerow({
+                          "t":
+                              t,
+                          "metric":
+                              metric,
+                          "n":
+                              len(values),
+                          "mean_ms":
+                              f"{statistics.mean(values):.9f}",
+                          "median_ms":
+                              f"{statistics.median(values):.9f}",
+                          "sd_ms":
+                              f"{statistics.stdev(values):.9f}",
+                          "p95_ms":
+                              f"{percentile(values, 0.95):.9f}",
+                          "min_ms":
+                              f"{min(values):.9f}",
+                          "max_ms":
+                              f"{max(values):.9f}",
+                      })
+
+          print(
+              "LBED COMPARATIVE DATASET PASSED"
+          )
+          print(
+              f"Repetitions per t: "
+              f"{EXPECTED_REPS}"
+          )
+          print(
+              f"Recipient-set sizes: "
+              f"{EXPECTED_T}"
+          )
+          print(
+              f"Validated rows: "
+              f"{len(rows)}"
+          )
+          print(
+              "No benchmark rows were removed."
+          )
+          PY
+
+      - name: Record LBED comparative protocol
+        shell: bash
+        run: |
+          {
+            echo "scheme=LBED"
+            echo "workflow=LBED comparative grid benchmark"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
+            echo "cpu_count=$(nproc)"
+            echo "compiler=$(c++ --version | head -1)"
+            echo "cmake=$(cmake --version | head -1)"
+            echo "openssl=$(openssl version)"
+            echo "curve=BLS12-381"
+            echo "library=herumi-mcl"
+            echo "mcl_fp_bit=384"
+            echo "mcl_fr_bit=256"
+            echo "build_type=Release"
+            echo "payload_bytes=1024"
+            echo "warmup_repetitions=10"
+            echo "measured_repetitions=100"
+            echo "t_values=32,64,128,256,512,1024"
+            echo "expected_measurements=600"
+            echo "mode=single-threaded"
+            echo "comparison_grid=matched_to_Garg_FlexBE"
+            echo "outlier_removal=none"
+          } > lbed_comparative_protocol.txt
+
+      - name: Enforce LBED comparative evidence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s \
+            lbed_comparative_raw.csv
+
+          test -s \
+            lbed_comparative_summary.csv
+
+          test -s \
+            lbed_comparative_protocol.txt
+
+          RAW_ROWS=$(
+            tail -n +2 \
+              lbed_comparative_summary.csv |
+            wc -l
+          )
+
+          if [ "${RAW_ROWS}" -ne 30 ]; then
+            echo \
+              "ERROR: expected 30 summary rows"
+
+            echo \
+              "Observed: ${RAW_ROWS}"
+
+            exit 1
+          fi
+
+          echo \
+            "LBED COMPARATIVE PERFORMANCE EVIDENCE GATE PASSED"
+
+          echo \
+            "Recipient-set sizes: 32,64,128,256,512,1024"
+
+          echo \
+            "Measured repetitions per t: 100"
+
+          echo \
+            "Summary rows: ${RAW_ROWS}"
+
+          echo \
+            "No benchmark rows were removed."
+
+      - name: Upload LBED comparative benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbed-comparative-grid-results
+          path: |
+            lbed_comparative_raw.csv
+            lbed_comparative_summary.csv
+            lbed_comparative_protocol.txt
+          if-no-files-found: warn
+          retention-days: 90
