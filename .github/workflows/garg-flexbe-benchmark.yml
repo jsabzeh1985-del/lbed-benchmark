@@ -1,0 +1,576 @@
+name: Garg FlexBE Performance Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  garg-flexbe-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout LBED benchmark repository
+        uses: actions/checkout@v4
+
+      - name: Record runner information
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=== GitHub Actions runner ==="
+          uname -a
+          lscpu
+          free -h
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            libsodium-dev \
+            libgmp-dev \
+            libssl-dev \
+            pkg-config \
+            libffi-dev
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Clone official FlexBroadcast repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            https://github.com/RachitG54/FlexBroadcast.git \
+            FlexBroadcast
+
+          cd FlexBroadcast
+
+          git checkout \
+            6c8e180d05de2e784437a0a4b191947d70b6c747
+
+          echo "=== FlexBroadcast revision ==="
+          git rev-parse HEAD
+
+          test "$(git rev-parse HEAD)" = \
+            "6c8e180d05de2e784437a0a4b191947d70b6c747"
+
+      - name: Create Python environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python -m venv garg-venv
+          source garg-venv/bin/activate
+
+          python --version
+
+          python -m pip install --upgrade \
+            "pip<24.1" \
+            setuptools \
+            wheel
+
+          python -m pip install \
+            "numpy<2" \
+            scipy \
+            petrelic==0.1.5
+
+          echo "=== Installed packages ==="
+          python -m pip freeze
+
+      - name: Verify Petrelic backend
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          source garg-venv/bin/activate
+
+          python - <<'PY'
+          from petrelic.multiplicative.pairing import G1, G2, GT
+
+          g1 = G1.generator()
+          g2 = G2.generator()
+          gt = g1.pair(g2)
+
+          assert g1 is not None
+          assert g2 is not None
+          assert gt is not None
+
+          print("PETRELIC BACKEND CHECK PASSED")
+          print("G1_bytes =", len(g1.to_binary()))
+          print("G2_bytes =", len(g2.to_binary()))
+          print("GT_bytes =", len(gt.to_binary()))
+          PY
+
+      - name: Run official FlexBroadcast correctness test
+        working-directory: FlexBroadcast
+        shell: bash
+        run: |
+          source ../garg-venv/bin/activate
+
+          set +e
+          set -o pipefail
+
+          bash testscript.sh \
+            2>&1 | tee ../garg_flexbe_correctness.log
+
+          STATUS=${PIPESTATUS[0]}
+
+          echo "${STATUS}" \
+            > ../garg_flexbe_correctness_exit_code.txt
+
+          echo "Official correctness exit code: ${STATUS}"
+
+          exit "${STATUS}"
+
+      - name: Enforce correctness prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s garg_flexbe_correctness.log
+          test -s garg_flexbe_correctness_exit_code.txt
+
+          STATUS="$(cat garg_flexbe_correctness_exit_code.txt)"
+
+          if [ "${STATUS}" != "0" ]; then
+            echo "GARG FLEXBE CORRECTNESS PREREQUISITE FAILED"
+            exit 1
+          fi
+
+          grep -q \
+            "Testing Decryption" \
+            garg_flexbe_correctness.log
+
+          grep -q \
+            "Testing the centralized broadcast scheme" \
+            garg_flexbe_correctness.log
+
+          grep -q \
+            "Testing the public key encryption scheme" \
+            garg_flexbe_correctness.log
+
+          echo "GARG FLEXBE CORRECTNESS PREREQUISITE PASSED"
+
+      - name: Verify official benchmark source
+        working-directory: FlexBroadcast/Flex/KMW
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f simulatedKgrow.py
+
+          echo "=== Official benchmark source hash ==="
+          sha256sum simulatedKgrow.py
+
+          echo "=== Important benchmark parameters ==="
+          grep -n "repeat = " simulatedKgrow.py
+          grep -n "cachetest = " simulatedKgrow.py
+          grep -n "sizesim = " simulatedKgrow.py
+          grep -n "rangemin = " simulatedKgrow.py
+          grep -n "rangemax = " simulatedKgrow.py
+
+      - name: Run controlled Garg FlexBE benchmark
+        working-directory: FlexBroadcast/Flex/KMW
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source ../../../garg-venv/bin/activate
+
+          mkdir -p ../../../garg_benchmark_trials
+
+          N=1048576
+          TRIALS=5
+
+          for TRIAL in $(seq 1 "${TRIALS}"); do
+            echo "========================================"
+            echo "Garg FlexBE independent trial ${TRIAL}/${TRIALS}"
+            echo "N=${N}"
+            echo "========================================"
+
+            rm -f \
+              "benchmarks/timing${N}Kgrowsim/5-11bench.csv"
+
+            python simulatedKgrow.py "${N}" \
+              2>&1 | tee \
+              "../../../garg_trial_${TRIAL}.log"
+
+            RESULT_FILE="benchmarks/timing${N}Kgrowsim/5-11bench.csv"
+
+            test -s "${RESULT_FILE}"
+
+            cp "${RESULT_FILE}" \
+              "../../../garg_benchmark_trials/trial_${TRIAL}.tsv"
+          done
+
+          echo "=== Trial files generated ==="
+          ls -lh ../../../garg_benchmark_trials
+
+      - name: Build raw and statistical datasets
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import csv
+          import math
+          import statistics
+          from pathlib import Path
+
+          TRIAL_DIR = Path("garg_benchmark_trials")
+          RAW_OUT = Path("garg_flexbe_raw.csv")
+          SUMMARY_OUT = Path("garg_flexbe_summary.csv")
+
+          EXPECTED_TRIALS = 5
+          EXPECTED_N = 1048576
+          EXPECTED_K = [32, 64, 128, 256, 512, 1024]
+          INNER_REPS = 100
+
+          rows = []
+
+          for trial in range(1, EXPECTED_TRIALS + 1):
+              path = TRIAL_DIR / f"trial_{trial}.tsv"
+
+              if not path.exists():
+                  raise SystemExit(
+                      f"ERROR: missing benchmark file {path}"
+                  )
+
+              with path.open(
+                  newline="",
+                  encoding="utf-8"
+              ) as f:
+                  reader = csv.DictReader(
+                      f,
+                      delimiter="\t"
+                  )
+
+                  trial_rows = list(reader)
+
+              if len(trial_rows) != len(EXPECTED_K):
+                  raise SystemExit(
+                      f"ERROR: trial {trial} has "
+                      f"{len(trial_rows)} rows; "
+                      f"expected {len(EXPECTED_K)}"
+                  )
+
+              found_k = []
+
+              for row in trial_rows:
+                  n = int(row["N"])
+                  k = int(row["K"])
+
+                  if n != EXPECTED_N:
+                      raise SystemExit(
+                          f"ERROR: unexpected N={n}"
+                      )
+
+                  found_k.append(k)
+
+                  enc_s = float(row["enc"])
+                  dec_s = float(row["dec"])
+
+                  if not math.isfinite(enc_s) or enc_s < 0:
+                      raise SystemExit(
+                          f"ERROR: invalid encryption time "
+                          f"in trial {trial}, K={k}"
+                      )
+
+                  if not math.isfinite(dec_s) or dec_s < 0:
+                      raise SystemExit(
+                          f"ERROR: invalid decryption time "
+                          f"in trial {trial}, K={k}"
+                      )
+
+                  rows.append({
+                      "trial": trial,
+                      "N": n,
+                      "K": k,
+                      "Bsetsize": int(row["Bsetsize"]),
+                      "inner_repetitions": INNER_REPS,
+                      "enc_ms": enc_s * 1000.0,
+                      "dec_ms": dec_s * 1000.0,
+                      "ctsize_bytes": int(row["ctsize"]),
+                      "CRSsize_bytes": int(row["CRSsize"]),
+                      "pkdsize_bytes": int(row["pkdsize"]),
+                      "skdsize_bytes": int(row["skdsize"]),
+                      "CRSgen_s": float(row["CRSgen"]),
+                      "pkdgen_s": float(row["pkdgen"]),
+                  })
+
+              if sorted(found_k) != EXPECTED_K:
+                  raise SystemExit(
+                      f"ERROR: trial {trial} K values "
+                      f"{sorted(found_k)} do not match "
+                      f"{EXPECTED_K}"
+                  )
+
+          expected_rows = (
+              EXPECTED_TRIALS
+              * len(EXPECTED_K)
+          )
+
+          if len(rows) != expected_rows:
+              raise SystemExit(
+                  f"ERROR: expected {expected_rows} "
+                  f"aggregate trial rows, got {len(rows)}"
+              )
+
+          raw_fields = [
+              "trial",
+              "N",
+              "K",
+              "Bsetsize",
+              "inner_repetitions",
+              "enc_ms",
+              "dec_ms",
+              "ctsize_bytes",
+              "CRSsize_bytes",
+              "pkdsize_bytes",
+              "skdsize_bytes",
+              "CRSgen_s",
+              "pkdgen_s",
+          ]
+
+          with RAW_OUT.open(
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=raw_fields
+              )
+              writer.writeheader()
+
+              for row in rows:
+                  out = dict(row)
+                  out["enc_ms"] = (
+                      f"{row['enc_ms']:.9f}"
+                  )
+                  out["dec_ms"] = (
+                      f"{row['dec_ms']:.9f}"
+                  )
+                  writer.writerow(out)
+
+          def percentile(values, p):
+              xs = sorted(values)
+
+              if len(xs) == 1:
+                  return xs[0]
+
+              pos = (len(xs) - 1) * p
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+
+              if lo == hi:
+                  return xs[lo]
+
+              return (
+                  xs[lo] * (hi - pos)
+                  + xs[hi] * (pos - lo)
+              )
+
+          summary_fields = [
+              "K",
+              "metric",
+              "n_independent_trials",
+              "inner_repetitions_per_trial",
+              "mean_ms",
+              "median_ms",
+              "sd_ms",
+              "p95_ms",
+              "min_ms",
+              "max_ms",
+              "ctsize_bytes",
+          ]
+
+          with SUMMARY_OUT.open(
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=summary_fields
+              )
+
+              writer.writeheader()
+
+              for k in EXPECTED_K:
+                  group = [
+                      r for r in rows
+                      if r["K"] == k
+                  ]
+
+                  ct_sizes = {
+                      r["ctsize_bytes"]
+                      for r in group
+                  }
+
+                  if len(ct_sizes) != 1:
+                      raise SystemExit(
+                          f"ERROR: ciphertext size "
+                          f"varied across trials for K={k}"
+                      )
+
+                  ct_size = next(iter(ct_sizes))
+
+                  for metric in [
+                      "enc_ms",
+                      "dec_ms"
+                  ]:
+                      values = [
+                          r[metric]
+                          for r in group
+                      ]
+
+                      writer.writerow({
+                          "K": k,
+                          "metric": metric,
+                          "n_independent_trials":
+                              len(values),
+                          "inner_repetitions_per_trial":
+                              INNER_REPS,
+                          "mean_ms":
+                              f"{statistics.mean(values):.9f}",
+                          "median_ms":
+                              f"{statistics.median(values):.9f}",
+                          "sd_ms":
+                              f"{statistics.stdev(values):.9f}",
+                          "p95_ms":
+                              f"{percentile(values, 0.95):.9f}",
+                          "min_ms":
+                              f"{min(values):.9f}",
+                          "max_ms":
+                              f"{max(values):.9f}",
+                          "ctsize_bytes":
+                              ct_size,
+                      })
+
+          print(
+              "GARG FLEXBE PERFORMANCE DATASET PASSED"
+          )
+          print(
+              f"Independent trials: {EXPECTED_TRIALS}"
+          )
+          print(
+              f"Official inner repetitions per "
+              f"trial: {INNER_REPS}"
+          )
+          print(
+              f"K values: {EXPECTED_K}"
+          )
+          print(
+              f"Aggregate trial rows: {len(rows)}"
+          )
+          print(
+              "No benchmark trial rows were removed."
+          )
+          PY
+
+      - name: Record benchmark protocol
+        shell: bash
+        run: |
+          {
+            echo "scheme=Garg-Lu-Waters-Wu-Flexible-Broadcast-Encryption"
+            echo "repository=https://github.com/RachitG54/FlexBroadcast"
+            echo "commit=6c8e180d05de2e784437a0a4b191947d70b6c747"
+            echo "benchmark_source=Flex/KMW/simulatedKgrow.py"
+            echo "benchmark_source_sha256=$(sha256sum FlexBroadcast/Flex/KMW/simulatedKgrow.py | awk '{print $1}')"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "cpu_model=$(lscpu | grep 'Model name' | head -1)"
+            echo "cpu_count=$(nproc)"
+            echo "python=$(python --version 2>&1)"
+            echo "petrelic=$(garg-venv/bin/python -m pip show petrelic | grep '^Version:' | awk '{print $2}')"
+            echo "N=1048576"
+            echo "K_values=32,64,128,256,512,1024"
+            echo "independent_trials=5"
+            echo "official_inner_repetitions=100"
+            echo "official_cachetest_native_keygens=10"
+            echo "large_key_material_mode=simulated_after_first_10_native_keygens"
+            echo "encryption_operation=actual_FlexBroadcast_encfull"
+            echo "decryption_operation=actual_FlexBroadcast_decfull"
+            echo "primary_runtime_metrics=enc_ms,dec_ms"
+            echo "primary_communication_metric=ctsize_bytes"
+            echo "CRSgen_and_pkdgen_not_eligible_for_direct_LBED_runtime_comparison=yes"
+            echo "reason=official_large_scale_script_uses_simulated_key_material_after_10_native_keygens"
+            echo "raw_rows_are_trial_level_means_of_100_inner_repetitions=yes"
+            echo "outlier_removal=none"
+          } > garg_flexbe_protocol.txt
+
+          {
+            echo
+            echo "=== Python packages ==="
+            garg-venv/bin/python -m pip freeze
+          } >> garg_flexbe_protocol.txt
+
+      - name: Enforce performance evidence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s garg_flexbe_raw.csv
+          test -s garg_flexbe_summary.csv
+          test -s garg_flexbe_protocol.txt
+
+          RAW_ROWS=$(
+            tail -n +2 garg_flexbe_raw.csv |
+            wc -l
+          )
+
+          SUMMARY_ROWS=$(
+            tail -n +2 garg_flexbe_summary.csv |
+            wc -l
+          )
+
+          if [ "${RAW_ROWS}" -ne 30 ]; then
+            echo "ERROR: expected 30 raw aggregate rows"
+            echo "Observed: ${RAW_ROWS}"
+            exit 1
+          fi
+
+          if [ "${SUMMARY_ROWS}" -ne 12 ]; then
+            echo "ERROR: expected 12 summary rows"
+            echo "Observed: ${SUMMARY_ROWS}"
+            exit 1
+          fi
+
+          echo "GARG FLEXBE PERFORMANCE EVIDENCE GATE PASSED"
+          echo "Independent benchmark trials: 5"
+          echo "Official inner repetitions per K per trial: 100"
+          echo "Recipient-set sizes: 32,64,128,256,512,1024"
+          echo "Raw aggregate rows: ${RAW_ROWS}"
+          echo "Summary rows: ${SUMMARY_ROWS}"
+          echo "No benchmark trial rows were removed."
+
+      - name: Upload Garg FlexBE benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garg-flexbe-performance-results
+          path: |
+            garg_flexbe_raw.csv
+            garg_flexbe_summary.csv
+            garg_flexbe_protocol.txt
+            garg_flexbe_correctness.log
+            garg_flexbe_correctness_exit_code.txt
+            garg_benchmark_trials/
+            garg_trial_1.log
+            garg_trial_2.log
+            garg_trial_3.log
+            garg_trial_4.log
+            garg_trial_5.log
+          if-no-files-found: warn
+          retention-days: 90
